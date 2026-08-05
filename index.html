@@ -21,9 +21,68 @@
     <meta name="twitter:image" content="https://steevenbogati.github.io/sinergia-historial-clinico/assets/logo.png" />
     <script type="module" crossorigin src="./assets/index-QS0_J3gE.js"></script>
     <link rel="stylesheet" crossorigin href="./assets/index-oPZcA92y.css">
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
   </head>
 
   <body class="bg-stone-50 text-stone-900 antialiased selection:bg-amber-600 selection:text-white">
+    <div id="sinergia-auth-gate" style="position:fixed;inset:0;z-index:99999;background:#0f172a;display:flex;align-items:center;justify-content:center;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;padding:20px;">
+      <div style="width:100%;max-width:380px;background:#fff;border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,.45);padding:32px 28px;">
+        <img src="./assets/logo.png" alt="SINERGIA" style="height:70px;width:auto;display:block;margin:0 auto 18px;object-fit:contain;" />
+        <h1 style="margin:0 0 4px;text-align:center;font-size:18px;font-weight:800;color:#1c1917;">Acceso al sistema</h1>
+        <p style="margin:0 0 22px;text-align:center;font-size:12.5px;color:#78716c;">Historia Clínica — SINERGIAMED</p>
+        <div id="sag-loading" style="text-align:center;color:#78716c;font-size:13px;padding:10px 0;">Verificando acceso…</div>
+        <form id="sag-form" style="display:none;">
+          <label style="display:block;font-size:12px;font-weight:600;color:#44403c;margin-bottom:5px;">Correo electrónico</label>
+          <input id="sag-email" type="email" autocomplete="username" required style="width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #d6d3d1;border-radius:10px;font-size:14px;margin-bottom:14px;outline:none;" />
+          <label style="display:block;font-size:12px;font-weight:600;color:#44403c;margin-bottom:5px;">Contraseña</label>
+          <input id="sag-pass" type="password" autocomplete="current-password" required style="width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #d6d3d1;border-radius:10px;font-size:14px;margin-bottom:16px;outline:none;" />
+          <button id="sag-btn" type="submit" style="width:100%;padding:11px;border:0;border-radius:10px;background:#0284c7;color:#fff;font-size:14px;font-weight:700;cursor:pointer;">Iniciar sesión</button>
+          <p id="sag-error" style="display:none;margin:12px 0 0;text-align:center;font-size:12.5px;color:#dc2626;"></p>
+        </form>
+      </div>
+    </div>
+    <script>
+      (function () {
+        var URL_ = "https://yobhrbxrqupuqygryceb.supabase.co";
+        var KEY_ = "sb_publishable_LvoKk-1WDkdwio8iNc4C3g_V2R7qwSo";
+        function start() {
+          if (!window.supabase || !window.supabase.createClient) { setTimeout(start, 50); return; }
+          var sb = window.supabase.createClient(URL_, KEY_);
+          var gate = document.getElementById("sinergia-auth-gate");
+          var loading = document.getElementById("sag-loading");
+          var form = document.getElementById("sag-form");
+          var err = document.getElementById("sag-error");
+          var btn = document.getElementById("sag-btn");
+          function addLogout() {
+            if (document.getElementById("sinergia-logout")) return;
+            var lb = document.createElement("button");
+            lb.id = "sinergia-logout";
+            lb.textContent = "Salir";
+            lb.style.cssText = "position:fixed;bottom:14px;left:14px;z-index:99998;background:#1c1917;color:#fff;border:0;border-radius:8px;padding:7px 12px;font-size:12px;font-weight:600;cursor:pointer;opacity:.85;font-family:system-ui,sans-serif;";
+            lb.onclick = function () { sb.auth.signOut().then(function () { location.reload(); }); };
+            document.body.appendChild(lb);
+          }
+          sb.auth.getSession().then(function (r) {
+            if (r.data && r.data.session) { gate.parentNode.removeChild(gate); addLogout(); }
+            else { loading.style.display = "none"; form.style.display = "block"; }
+          });
+          form.addEventListener("submit", function (e) {
+            e.preventDefault();
+            err.style.display = "none"; btn.disabled = true; btn.textContent = "Entrando…";
+            sb.auth.signInWithPassword({
+              email: document.getElementById("sag-email").value.trim(),
+              password: document.getElementById("sag-pass").value
+            }).then(function (r) {
+              if (r.error) {
+                err.textContent = r.error.message === "Invalid login credentials" ? "Correo o contraseña incorrectos." : r.error.message;
+                err.style.display = "block"; btn.disabled = false; btn.textContent = "Iniciar sesión";
+              } else { location.reload(); }
+            });
+          });
+        }
+        start();
+      })();
+    </script>
     <div id="root"></div>
   </body>
 </html>
