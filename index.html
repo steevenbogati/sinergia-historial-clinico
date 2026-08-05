@@ -62,9 +62,44 @@
             lb.onclick = function () { sb.auth.signOut().then(function () { location.reload(); }); };
             document.body.appendChild(lb);
           }
+          function seedFromCloud() {
+            var tables = [
+              { t: "clinical_records", field: "record_data", key: "sinergiamed_patients_v1" },
+              { t: "hyperbaric_patients", field: "patient_data", key: "sinergiamed_hyperbaric_patients_v1" },
+              { t: "hyperbaric_sessions", field: "session_data", key: "sinergiamed_hyperbaric_sessions_v1" }
+            ];
+            return Promise.all(tables.map(function (cfg) {
+              return sb.from(cfg.t).select(cfg.field).then(function (res) {
+                if (res.error || !res.data) return false;
+                var cloud = res.data.map(function (r) { return r[cfg.field]; }).filter(Boolean);
+                if (cloud.length === 0) return false;
+                var local = [];
+                try { local = JSON.parse(localStorage.getItem(cfg.key) || "[]"); } catch (e) { local = []; }
+                if (!Array.isArray(local)) local = [];
+                var byId = {};
+                local.forEach(function (x) { if (x && x.id != null) byId[x.id] = x; });
+                cloud.forEach(function (x) { if (x && x.id != null) byId[x.id] = x; });
+                var merged = Object.keys(byId).map(function (k) { return byId[k]; });
+                var newStr = JSON.stringify(merged);
+                if (newStr !== JSON.stringify(local)) { localStorage.setItem(cfg.key, newStr); return true; }
+                return false;
+              }).catch(function () { return false; });
+            })).then(function (results) { return results.indexOf(true) !== -1; });
+          }
           sb.auth.getSession().then(function (r) {
-            if (r.data && r.data.session) { gate.parentNode.removeChild(gate); addLogout(); }
-            else { loading.style.display = "none"; form.style.display = "block"; }
+            if (r.data && r.data.session) {
+              if (!sessionStorage.getItem("sinergia_seeded")) {
+                sessionStorage.setItem("sinergia_seeded", "1");
+                seedFromCloud().then(function (changed) {
+                  if (changed) { location.reload(); }
+                  else { gate.parentNode.removeChild(gate); addLogout(); }
+                });
+              } else {
+                gate.parentNode.removeChild(gate); addLogout();
+              }
+            } else {
+              loading.style.display = "none"; form.style.display = "block";
+            }
           });
           form.addEventListener("submit", function (e) {
             e.preventDefault();

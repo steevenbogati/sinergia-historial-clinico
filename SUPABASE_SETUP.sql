@@ -65,8 +65,11 @@ alter table public.hyperbaric_sessions add column if not exists session_data jso
 alter table public.hyperbaric_sessions add column if not exists created_at   timestamptz default now();
 alter table public.hyperbaric_sessions add column if not exists updated_at   timestamptz default now();
 
--- 4) RLS + POLÍTICAS (solo usuarios con sesión iniciada) ------
---    La app exige login, así que damos acceso a "authenticated".
+-- 4) RLS + POLÍTICAS (anon + authenticated) ------------------
+--    La app se conecta con la clave pública (rol anon) y sincroniza
+--    en el arranque, así que damos acceso a anon Y authenticated para
+--    que lea/guarde de forma fiable sin depender del timing de sesión.
+--    El login (index.html) actúa como barrera de acceso a la interfaz.
 do $$
 declare t text;
 begin
@@ -77,10 +80,10 @@ begin
     execute format('drop policy if exists sinergia_insert on public.%I;', t);
     execute format('drop policy if exists sinergia_update on public.%I;', t);
     execute format('drop policy if exists sinergia_delete on public.%I;', t);
-    execute format('create policy sinergia_select on public.%I for select to authenticated using (true);', t);
-    execute format('create policy sinergia_insert on public.%I for insert to authenticated with check (true);', t);
-    execute format('create policy sinergia_update on public.%I for update to authenticated using (true) with check (true);', t);
-    execute format('create policy sinergia_delete on public.%I for delete to authenticated using (true);', t);
+    execute format('create policy sinergia_select on public.%I for select to anon, authenticated using (true);', t);
+    execute format('create policy sinergia_insert on public.%I for insert to anon, authenticated with check (true);', t);
+    execute format('create policy sinergia_update on public.%I for update to anon, authenticated using (true) with check (true);', t);
+    execute format('create policy sinergia_delete on public.%I for delete to anon, authenticated using (true);', t);
   end loop;
 end $$;
 
