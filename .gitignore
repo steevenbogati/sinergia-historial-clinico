@@ -1,0 +1,14 @@
+# Dependencias
+node_modules/
+
+# Vercel
+.vercel/
+
+# Variables de entorno / secretos (NUNCA subir la clave sb_secret_)
+.env
+.env.*
+*.local
+
+# Sistema
+.DS_Store
+Thumbs.db
