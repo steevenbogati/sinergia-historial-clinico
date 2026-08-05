@@ -83,7 +83,9 @@ begin
     execute format('create policy sinergia_select on public.%I for select to anon, authenticated using (true);', t);
     execute format('create policy sinergia_insert on public.%I for insert to anon, authenticated with check (true);', t);
     execute format('create policy sinergia_update on public.%I for update to anon, authenticated using (true) with check (true);', t);
-    execute format('create policy sinergia_delete on public.%I for delete to anon, authenticated using (true);', t);
+    -- SIN política de DELETE a propósito: ningún cliente (ni con código viejo
+    -- en caché) puede borrar historias. Protege contra pérdida de datos.
+    -- Para borrar algo puntual, hazlo desde el dashboard de Supabase.
   end loop;
 end $$;
 
