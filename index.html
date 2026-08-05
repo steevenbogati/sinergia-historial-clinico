@@ -107,7 +107,7 @@
           appStarted = true;
           var s = document.createElement("script");
           s.type = "module"; s.crossOrigin = "anonymous";
-          s.src = "./assets/index-sinergia-v4.js";
+          s.src = "./assets/index-sinergia-v5.js";
           document.body.appendChild(s);
         }
         function showReload(n) {
@@ -148,9 +148,9 @@
           // Limpieza única: descarta la copia local obsoleta de este dispositivo
           // (con registros ya borrados) y deja que la nube sea la única verdad.
           try {
-            if (!localStorage.getItem("sinergia_purge_v1")) {
+            if (!localStorage.getItem("sinergia_purge_v2")) {
               TABLES.forEach(function (c) { localStorage.removeItem(c.key); });
-              localStorage.setItem("sinergia_purge_v1", "1");
+              localStorage.setItem("sinergia_purge_v2", "1");
             }
           } catch (e) {}
           // 1) PRIMERO traer la nube, 2) LUEGO arrancar la app (sin carreras)
