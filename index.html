@@ -41,143 +41,486 @@
       </div>
     </div>
     <script>
+      /* ==================================================================
+         SINERGIAMED — Capa de datos v6
+         ------------------------------------------------------------------
+         Supabase es la ÚNICA fuente de verdad. El disco del dispositivo NO
+         guarda historias clínicas: solo una "bandeja de salida" con lo que
+         todavía no se ha podido subir (unos pocos KB).
+
+         Por qué: localStorage tiene un tope de ~5 MB. Las firmas se guardan
+         como imágenes dentro de cada registro, así que el archivo crecía sin
+         freno hasta reventar el tope -> "The quota has been exceeded." y, a
+         partir de ahí, los guardados fallaban en silencio.
+
+         Cómo: se intercepta localStorage SOLO para las 3 claves de datos.
+         La app sigue llamando a localStorage.setItem() igual que siempre,
+         pero por debajo los datos viven en memoria + Supabase. Todo lo demás
+         (sesión de login sb-*, config) pasa al localStorage real intacto.
+         ================================================================== */
       (function () {
+        "use strict";
+
         var URL_ = "https://yobhrbxrqupuqygryceb.supabase.co";
         var KEY_ = "sb_publishable_LvoKk-1WDkdwio8iNc4C3g_V2R7qwSo";
-        var TABLES = [
-          { t: "clinical_records", field: "record_data", key: "sinergiamed_patients_v1",
-            map: function (r) { return { id: r.id, hc_number: r.hcNumber || null, patient_name: (r.patient && r.patient.fullName) || null, id_number: (r.patient && r.patient.idNumber) || null, record_data: r }; } },
-          { t: "hyperbaric_patients", field: "patient_data", key: "sinergiamed_hyperbaric_patients_v1",
-            map: function (r) { return { id: r.id, full_name: r.fullName || null, id_number: r.idNumber || null, phone: r.phone || null, email: r.email || null, patient_data: r }; } },
-          { t: "hyperbaric_sessions", field: "session_data", key: "sinergiamed_hyperbaric_sessions_v1",
-            map: function (r) { return { id: r.id, patient_id: r.patientId || null, session_num: r.sessionNum || null, session_date: r.date || null, time_in: r.timeIn || null, time_out: r.timeOut || null, session_data: r }; } }
-        ];
-        var sb = null, badge = null, appStarted = false;
 
-        function readLocal(key) {
-          try { var v = JSON.parse(localStorage.getItem(key) || "[]"); return Array.isArray(v) ? v : []; }
+        var OUTBOX_KEY   = "sinergia_outbox_v1";
+        var PULL_MS      = 60000;   // refresco desde la nube
+        var FLUSH_MS     = 1500;    // espera antes de subir (agrupa ráfagas)
+        var CHUNK_ROWS   = 20;      // filas por request
+        var CHUNK_BYTES  = 600000;  // ~600 KB por request: sobrevive a datos móviles
+        var SKEW_MS      = 120000;  // margen por desfase de reloj entre dispositivos
+
+        // Referencia al localStorage REAL, capturada antes de instalar el shim.
+        var RAW = window.localStorage;
+
+        var MANAGED = [
+          { key: "sinergiamed_patients_v1", table: "clinical_records", field: "record_data",
+            map: function (r) {
+              return { id: r.id, hc_number: r.hcNumber || null,
+                       patient_name: (r.patient && r.patient.fullName) || null,
+                       id_number: (r.patient && r.patient.idNumber) || null, record_data: r };
+            } },
+          { key: "sinergiamed_hyperbaric_patients_v1", table: "hyperbaric_patients", field: "patient_data",
+            map: function (r) {
+              return { id: r.id, full_name: r.fullName || null, id_number: r.idNumber || null,
+                       phone: r.phone || null, email: r.email || null, patient_data: r };
+            } },
+          { key: "sinergiamed_hyperbaric_sessions_v1", table: "hyperbaric_sessions", field: "session_data",
+            map: function (r) {
+              return { id: r.id, patient_id: r.patientId || null, session_num: r.sessionNum || null,
+                       session_date: r.date || null, time_in: r.timeIn || null,
+                       time_out: r.timeOut || null, session_data: r };
+            } }
+        ];
+        var BY_KEY = {};
+        MANAGED.forEach(function (c) { BY_KEY[c.key] = c; });
+
+        var sb = null;
+        var appStarted = false;
+        var mem = {};      // key -> string JSON (lo que la app "ve")
+        var synced = {};   // key -> { id: hash }  ya confirmado en la nube
+        var outbox = {};   // key -> { id: fila }  pendiente de subir
+        var lastSeen = {}; // table -> updated_at máximo visto
+        var knownIds = {}; // key -> { id: true }
+        var flushTimer = null, flushing = false, backoff = 0, pendingNew = 0;
+
+        /* ---------------------------------------------------------- utils */
+        function hash(s) {
+          var h = 5381, i = s.length;
+          while (i) h = (h * 33) ^ s.charCodeAt(--i);
+          return (h >>> 0).toString(36);
+        }
+        function parseArr(s) {
+          try { var v = JSON.parse(s || "[]"); return Array.isArray(v) ? v : []; }
           catch (e) { return []; }
         }
+        function rawGet(k) { try { return RAW.getItem(k); } catch (e) { return null; } }
+        function rawSet(k, v) { try { RAW.setItem(k, v); return true; } catch (e) { return false; } }
+        function rawDel(k) { try { RAW.removeItem(k); } catch (e) {} }
+
+        /* --------------------------------------------------------- bandeja */
+        function loadOutbox() {
+          var o = {};
+          try { o = JSON.parse(rawGet(OUTBOX_KEY) || "{}") || {}; } catch (e) { o = {}; }
+          MANAGED.forEach(function (c) { if (!o[c.key] || typeof o[c.key] !== "object") o[c.key] = {}; });
+          return o;
+        }
+        function saveOutbox() {
+          if (rawSet(OUTBOX_KEY, JSON.stringify(outbox))) return true;
+          // La bandeja no cabe en disco (caso extremo). Se conserva en memoria
+          // y se avisa: NO se pierde nada mientras la pestaña siga abierta.
+          setBadge("⚠ Sin espacio para el respaldo local — no cierres la app hasta que suba", "#b45309", true);
+          return false;
+        }
+        function outboxCount() {
+          var n = 0;
+          MANAGED.forEach(function (c) { n += Object.keys(outbox[c.key] || {}).length; });
+          return n;
+        }
+
+        /* ------------------------------------------------- shim de storage */
+        function readManaged(key) { return Object.prototype.hasOwnProperty.call(mem, key) ? mem[key] : null; }
+
+        function writeManaged(key, value) {
+          var prev = mem[key];
+          mem[key] = String(value);
+          if (prev === mem[key]) return;            // nada cambió
+          var rows = parseArr(mem[key]);
+          var sk = synced[key] || (synced[key] = {});
+          var ob = outbox[key] || (outbox[key] = {});
+          var dirty = false;
+          for (var i = 0; i < rows.length; i++) {
+            var r = rows[i];
+            if (!r || r.id == null) continue;
+            knownIds[key][r.id] = true;
+            var h = hash(JSON.stringify(r));
+            if (sk[r.id] === h) { if (ob[r.id]) { delete ob[r.id]; dirty = true; } continue; }
+            ob[r.id] = r;
+            dirty = true;
+          }
+          if (dirty) { saveOutbox(); scheduleFlush(); renderPending(); }
+        }
+
+        function installShim() {
+          var shim = {
+            getItem: function (k) { return BY_KEY[k] ? readManaged(k) : rawGet(k); },
+            setItem: function (k, v) { if (BY_KEY[k]) writeManaged(k, v); else if (!rawSet(k, v)) throw new Error("No hay espacio en el dispositivo para " + k); },
+            // No se borra nada de la nube: quitar la clave local solo vacía la vista.
+            removeItem: function (k) { if (BY_KEY[k]) mem[k] = "[]"; else rawDel(k); },
+            clear: function () { MANAGED.forEach(function (c) { mem[c.key] = "[]"; }); try { RAW.clear(); } catch (e) {} },
+            key: function (i) { try { return RAW.key(i); } catch (e) { return null; } },
+            get length() { try { return RAW.length; } catch (e) { return 0; } }
+          };
+          try {
+            Object.defineProperty(window, "localStorage", { configurable: true, get: function () { return shim; } });
+            return true;
+          } catch (e) {
+            // Plan B: parchear el prototipo filtrando por clave.
+            try {
+              var g = Storage.prototype.getItem, s = Storage.prototype.setItem, d = Storage.prototype.removeItem;
+              Storage.prototype.getItem    = function (k) { return BY_KEY[k] ? readManaged(k) : g.call(this, k); };
+              Storage.prototype.setItem    = function (k, v) { if (BY_KEY[k]) writeManaged(k, v); else s.call(this, k, v); };
+              Storage.prototype.removeItem = function (k) { if (BY_KEY[k]) mem[k] = "[]"; else d.call(this, k); };
+              return true;
+            } catch (e2) { return false; }
+          }
+        }
+
+        /* ------------------------------------------------------------ nube */
+        function pullAll() {
+          return Promise.all(MANAGED.map(function (c) {
+            return sb.from(c.table).select(c.field + ",updated_at").then(function (res) {
+              if (res.error) throw new Error(c.table + ": " + res.error.message);
+              return { c: c, data: res.data || [] };
+            });
+          }));
+        }
+
+        function pullSince() {
+          return Promise.all(MANAGED.map(function (c) {
+            var q = sb.from(c.table).select(c.field + ",updated_at");
+            if (lastSeen[c.table]) {
+              q = q.gt("updated_at", new Date(new Date(lastSeen[c.table]).getTime() - SKEW_MS).toISOString());
+            }
+            return q.then(function (res) {
+              if (res.error) throw new Error(c.table + ": " + res.error.message);
+              return { c: c, data: res.data || [] };
+            });
+          }));
+        }
+
+        // Mezcla filas de la nube en memoria. Lo pendiente de subir SIEMPRE gana:
+        // son ediciones locales que la nube todavía no conoce.
+        function mergeCloud(batch) {
+          var nuevos = 0;
+          batch.forEach(function (b) {
+            var c = b.c, byId = {};
+            parseArr(mem[c.key]).forEach(function (r) { if (r && r.id != null) byId[r.id] = r; });
+            b.data.forEach(function (row) {
+              var r = row[c.field];
+              if (row.updated_at && (!lastSeen[c.table] || row.updated_at > lastSeen[c.table])) lastSeen[c.table] = row.updated_at;
+              if (!r || r.id == null) return;
+              if (outbox[c.key] && outbox[c.key][r.id]) return;   // edición local pendiente
+              if (!knownIds[c.key][r.id]) { knownIds[c.key][r.id] = true; nuevos++; }
+              byId[r.id] = r;
+              (synced[c.key] || (synced[c.key] = {}))[r.id] = hash(JSON.stringify(r));
+            });
+            mem[c.key] = JSON.stringify(Object.keys(byId).map(function (k) { return byId[k]; }));
+          });
+          return nuevos;
+        }
+
+        function scheduleFlush() {
+          if (flushTimer) clearTimeout(flushTimer);
+          flushTimer = setTimeout(flush, FLUSH_MS + backoff);
+        }
+
+        function flush() {
+          if (flushing || !sb) return Promise.resolve();
+          if (typeof navigator !== "undefined" && navigator.onLine === false) {
+            setBadge("⚠ Sin conexión — " + outboxCount() + " sin subir (a salvo)", "#b45309", true);
+            return Promise.resolve();
+          }
+          var jobs = [];
+          MANAGED.forEach(function (c) {
+            var ids = Object.keys(outbox[c.key] || {});
+            if (!ids.length) return;
+            var chunk = [], bytes = 0;
+            for (var i = 0; i < ids.length; i++) {
+              var row;
+              try { row = c.map(outbox[c.key][ids[i]]); } catch (e) { continue; }
+              row.updated_at = new Date().toISOString();
+              var size = JSON.stringify(row).length;
+              if (chunk.length && (chunk.length >= CHUNK_ROWS || bytes + size > CHUNK_BYTES)) break;
+              chunk.push({ id: ids[i], row: row }); bytes += size;
+            }
+            if (chunk.length) jobs.push({ c: c, chunk: chunk });
+          });
+          if (!jobs.length) { renderPending(); return Promise.resolve(); }
+
+          flushing = true;
+          setBadge("↑ Subiendo " + outboxCount() + "…", "#1d4ed8", true);
+          return Promise.all(jobs.map(function (j) {
+            return sb.from(j.c.table).upsert(j.chunk.map(function (x) { return x.row; }), { onConflict: "id" })
+              .then(function (res) {
+                if (res.error) throw new Error(j.c.table + ": " + res.error.message);
+                j.chunk.forEach(function (x) {
+                  var src = outbox[j.c.key][x.id];
+                  if (src) (synced[j.c.key] || (synced[j.c.key] = {}))[x.id] = hash(JSON.stringify(src));
+                  delete outbox[j.c.key][x.id];
+                });
+              });
+          })).then(function () {
+            flushing = false; backoff = 0; saveOutbox();
+            if (outboxCount() > 0) { scheduleFlush(); renderPending(); }
+            else setBadge("☁ Todo guardado en la nube", "#166534");
+          }).catch(function (e) {
+            flushing = false;
+            backoff = Math.min(backoff ? backoff * 2 : 3000, 60000);
+            setBadge("⚠ Reintentando — " + outboxCount() + " sin subir (a salvo)", "#b45309", true);
+            scheduleFlush();
+          });
+        }
+
+        /* ----------------------------------------------------------- badge */
+        var badge = null;
         function makeBadge() {
           if (badge) return badge;
           badge = document.createElement("div");
           badge.id = "sinergia-cloud-badge";
-          badge.style.cssText = "position:fixed;bottom:12px;right:12px;z-index:99998;background:#1c1917;color:#fff;border-radius:9px;padding:7px 11px;font:600 11.5px system-ui,sans-serif;opacity:.92;max-width:70vw;line-height:1.35;";
+          // pointer-events:none -> nunca vuelve a tapar un campo del formulario.
+          badge.style.cssText = "position:fixed;bottom:10px;right:10px;z-index:99998;background:#1c1917;" +
+            "color:#fff;border-radius:8px;padding:5px 9px;font:600 11px system-ui,sans-serif;opacity:.9;" +
+            "max-width:52vw;line-height:1.3;pointer-events:none;transition:opacity .3s;";
           document.body.appendChild(badge);
           return badge;
         }
-        function setBadge(text, color) {
+        var badgeTimer = null;
+        function setBadge(text, color, sticky) {
           makeBadge();
           badge.textContent = text;
           badge.style.background = color || "#1c1917";
+          badge.style.opacity = ".9";
+          if (badgeTimer) clearTimeout(badgeTimer);
+          if (!sticky) badgeTimer = setTimeout(function () { badge.style.opacity = "0"; }, 4000);
         }
-        // Trae de la nube y fusiona en localStorage (la nube manda en conflictos por id)
-        function pull() {
-          return Promise.all(TABLES.map(function (c) {
-            return sb.from(c.t).select(c.field).then(function (res) {
-              if (res.error) throw new Error(c.t + ": " + res.error.message);
-              var cloud = (res.data || []).map(function (x) { return x[c.field]; })
-                .filter(function (x) { return x && x.id != null; });
-              var local = readLocal(c.key), byId = {}, nuevos = 0;
-              local.forEach(function (x) { if (x && x.id != null) byId[x.id] = x; });
-              cloud.forEach(function (x) { if (!byId[x.id]) nuevos++; byId[x.id] = x; });
-              var merged = Object.keys(byId).map(function (k) { return byId[k]; });
-              localStorage.setItem(c.key, JSON.stringify(merged));
-              return { n: cloud.length, nuevos: nuevos };
+        function renderPending() {
+          var n = outboxCount();
+          if (n > 0) setBadge("↑ " + n + " por subir (a salvo)", "#b45309", true);
+        }
+        function showReload(n) {
+          if (document.getElementById("sinergia-reload")) return;
+          var b = document.createElement("button");
+          b.id = "sinergia-reload";
+          b.textContent = "↻ " + n + " registro(s) nuevo(s) — Recargar";
+          b.style.cssText = "position:fixed;bottom:44px;right:10px;z-index:99999;background:#0284c7;color:#fff;" +
+            "border:0;border-radius:8px;padding:8px 12px;font:700 11.5px system-ui,sans-serif;cursor:pointer;" +
+            "box-shadow:0 4px 14px rgba(0,0,0,.3);";
+          b.onclick = function () { location.reload(); };
+          document.body.appendChild(b);
+        }
+
+        // El bundle delega aquí su "Sincronizar con la nube": una sola capa manda.
+        window.__sgFlush = function () { return flush(); };
+
+        /* ------------------------------------- compresión de firmas (bundle) */
+        // El bundle llama a esto en vez de canvas.toDataURL(). Una firma pasa
+        // de ~10 KB (PNG) a ~1-2 KB, que es lo que permite que el upsert
+        // sobreviva en datos móviles.
+        window.__sgCompress = function (canvas) {
+          try {
+            var png = canvas.toDataURL();
+            // WebP conserva la transparencia y es el que menos pesa (~62% menos).
+            var webp = canvas.toDataURL("image/webp", 0.9);
+            if (webp.indexOf("data:image/webp") === 0 && webp.length < png.length) return webp;
+            // Safari antiguo no exporta WebP: JPEG, que sí necesita fondo blanco.
+            var off = document.createElement("canvas");
+            off.width = canvas.width; off.height = canvas.height;
+            var ctx = off.getContext("2d");
+            ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, off.width, off.height);
+            ctx.drawImage(canvas, 0, 0);
+            var jpg = off.toDataURL("image/jpeg", 0.85);
+            return (jpg.indexOf("data:image/jpeg") === 0 && jpg.length < png.length) ? jpg : png;
+          } catch (e) {
+            try { return canvas.toDataURL(); } catch (e2) { return ""; }
+          }
+        };
+
+        // Recomprime una firma ya guardada (data:image/png -> webp/jpeg).
+        function shrinkDataUri(uri) {
+          return new Promise(function (resolve) {
+            if (typeof uri !== "string" || uri.indexOf("data:image/png") !== 0) return resolve(uri);
+            var img = new Image();
+            img.onload = function () {
+              try {
+                var cv = document.createElement("canvas");
+                cv.width = img.width || 380; cv.height = img.height || 130;
+                cv.getContext("2d").drawImage(img, 0, 0);
+                resolve(window.__sgCompress(cv) || uri);
+              } catch (e) { resolve(uri); }
+            };
+            img.onerror = function () { resolve(uri); };
+            img.src = uri;
+          });
+        }
+
+        // Migración OPT-IN de las firmas ya guardadas. Es irreversible, por eso
+        // NO se ejecuta sola: hay que llamarla a mano desde la consola.
+        window.__sgMigrarFirmas = function () {
+          var tocados = 0;
+          function walk(o) {
+            if (!o || typeof o !== "object") return Promise.resolve();
+            var ps = [];
+            Object.keys(o).forEach(function (k) {
+              var v = o[k];
+              if (typeof v === "string" && /Signature(Data)?Uri$/.test(k) && v.indexOf("data:image/png") === 0) {
+                ps.push(shrinkDataUri(v).then(function (nv) { if (nv !== v) { o[k] = nv; tocados++; } }));
+              } else if (v && typeof v === "object") { ps.push(walk(v)); }
             });
-          }));
-        }
-        // Sube todo lo local a la nube (red de seguridad; nunca borra)
-        function push() {
-          return Promise.all(TABLES.map(function (c) {
-            var local = readLocal(c.key).filter(function (x) { return x && x.id != null; });
-            if (!local.length) return 0;
-            var rows = local.map(function (r) {
-              try { var m = c.map(r); m.updated_at = new Date().toISOString(); return m; } catch (e) { return null; }
-            }).filter(Boolean);
-            if (!rows.length) return 0;
-            return sb.from(c.t).upsert(rows, { onConflict: "id" }).then(function (res) {
-              if (res.error) throw new Error(c.t + ": " + res.error.message);
-              return rows.length;
-            });
-          }));
-        }
+            return Promise.all(ps);
+          }
+          var all = [];
+          MANAGED.forEach(function (c) {
+            var rows = parseArr(mem[c.key]);
+            all.push(walk(rows).then(function () {
+              mem[c.key] = JSON.stringify(rows);
+              rows.forEach(function (r) { if (r && r.id != null) outbox[c.key][r.id] = r; });
+            }));
+          });
+          return Promise.all(all).then(function () {
+            saveOutbox(); renderPending();
+            console.log("[SINERGIA] Firmas recomprimidas: " + tocados + ". Subiendo…");
+            return flush();
+          });
+        };
+
+        /* ------------------------------------------------------- arranque */
         function startApp() {
           if (appStarted) return;
           appStarted = true;
           var s = document.createElement("script");
           s.type = "module"; s.crossOrigin = "anonymous";
-          s.src = "./assets/index-sinergia-v5.js";
+          s.src = "./assets/index-sinergia-v6.js";
           document.body.appendChild(s);
         }
-        function showReload(n) {
-          var b = document.getElementById("sinergia-reload");
-          if (b) return;
-          b = document.createElement("button");
-          b.id = "sinergia-reload";
-          b.textContent = "↻ " + n + " registro(s) nuevo(s) — Recargar";
-          b.style.cssText = "position:fixed;bottom:52px;right:12px;z-index:99999;background:#0284c7;color:#fff;border:0;border-radius:9px;padding:9px 13px;font:700 12px system-ui,sans-serif;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.3);";
-          b.onclick = function () { location.reload(); };
-          document.body.appendChild(b);
-        }
-        function loopSync() {
-          setInterval(function () {
-            push().then(function () { return pull(); }).then(function (res) {
-              var total = res.reduce(function (a, x) { return a + x.n; }, 0);
-              var nuevos = res.reduce(function (a, x) { return a + x.nuevos; }, 0);
-              setBadge("☁ Nube OK · " + total + " en la nube", "#166534");
-              if (nuevos > 0) showReload(nuevos);
-            }).catch(function (e) {
-              setBadge("⚠ Nube: " + e.message, "#b91c1c");
-            });
-          }, 15000);
-        }
+
         function addLogout() {
           if (document.getElementById("sinergia-logout")) return;
           var lb = document.createElement("button");
           lb.id = "sinergia-logout";
           lb.textContent = "Salir";
-          lb.style.cssText = "position:fixed;bottom:12px;left:12px;z-index:99998;background:#1c1917;color:#fff;border:0;border-radius:9px;padding:7px 12px;font:600 11.5px system-ui,sans-serif;cursor:pointer;opacity:.85;";
-          lb.onclick = function () { sb.auth.signOut().then(function () { location.reload(); }); };
+          lb.style.cssText = "position:fixed;bottom:10px;left:10px;z-index:99998;background:#1c1917;color:#fff;" +
+            "border:0;border-radius:8px;padding:6px 11px;font:600 11px system-ui,sans-serif;cursor:pointer;opacity:.8;";
+          lb.onclick = function () {
+            if (outboxCount() > 0 && !confirm("Quedan " + outboxCount() + " registro(s) sin subir. ¿Salir igual?")) return;
+            sb.auth.signOut().then(function () { location.reload(); });
+          };
           document.body.appendChild(lb);
         }
+
+        // Rescata lo que haya quedado atrapado en el disco por el error de cuota
+        // y libera ese espacio. Las filas que la nube no tiene se ponen en cola.
+        function rescueLocal(cloudIds) {
+          var rescatados = 0;
+          MANAGED.forEach(function (c) {
+            var local = parseArr(rawGet(c.key));
+            local.forEach(function (r) {
+              if (!r || r.id == null) return;
+              if (cloudIds[c.key][r.id]) return;          // ya está en la nube
+              outbox[c.key][r.id] = r;
+              knownIds[c.key][r.id] = true;
+              rescatados++;
+              var cur = parseArr(mem[c.key]); cur.push(r); mem[c.key] = JSON.stringify(cur);
+            });
+            rawDel(c.key);                                 // libera la cuota
+          });
+          rawDel("sinergiamed_hyperbaric_v1");              // clave heredada
+          return rescatados;
+        }
+
         function enterApp() {
           var gate = document.getElementById("sinergia-auth-gate");
           var loading = document.getElementById("sag-loading");
           if (loading) loading.textContent = "Cargando datos de la nube…";
-          // Limpieza única: descarta la copia local obsoleta de este dispositivo
-          // (con registros ya borrados) y deja que la nube sea la única verdad.
-          try {
-            if (!localStorage.getItem("sinergia_purge_v2")) {
-              TABLES.forEach(function (c) { localStorage.removeItem(c.key); });
-              localStorage.setItem("sinergia_purge_v2", "1");
-            }
-          } catch (e) {}
-          // 1) PRIMERO traer la nube, 2) LUEGO arrancar la app (sin carreras)
-          pull().then(function (res) {
-            var total = res.reduce(function (a, x) { return a + x.n; }, 0);
+
+          MANAGED.forEach(function (c) { mem[c.key] = "[]"; synced[c.key] = {}; knownIds[c.key] = {}; });
+          outbox = loadOutbox();
+          MANAGED.forEach(function (c) {
+            Object.keys(outbox[c.key]).forEach(function (id) { knownIds[c.key][id] = true; });
+          });
+
+          function boot(err) {
             if (gate && gate.parentNode) gate.parentNode.removeChild(gate);
-            startApp(); addLogout();
-            setBadge("☁ Nube OK · " + total + " en la nube", "#166534");
+            installShim();
+            startApp();
+            addLogout();
+            if (err) setBadge("⚠ Nube: " + err, "#b91c1c", true);
+            else if (outboxCount() > 0) renderPending();
+            else setBadge("☁ Conectado", "#166534");
             loopSync();
+            flush();
+          }
+
+          pullAll().then(function (batch) {
+            var cloudIds = {};
+            batch.forEach(function (b) {
+              cloudIds[b.c.key] = {};
+              b.data.forEach(function (row) {
+                var r = row[b.c.field];
+                if (r && r.id != null) cloudIds[b.c.key][r.id] = true;
+              });
+            });
+            mergeCloud(batch);
+            var n = rescueLocal(cloudIds);
+            if (n > 0) { saveOutbox(); console.log("[SINERGIA] Rescatados del disco: " + n); }
+            boot(null);
           }).catch(function (e) {
-            if (gate && gate.parentNode) gate.parentNode.removeChild(gate);
-            startApp(); addLogout();
-            setBadge("⚠ Nube: " + e.message, "#b91c1c");
-            loopSync();
+            // Sin nube: no se borra nada del disco, se sigue con lo local.
+            MANAGED.forEach(function (c) {
+              var local = parseArr(rawGet(c.key));
+              mem[c.key] = JSON.stringify(local);
+              local.forEach(function (r) { if (r && r.id != null) knownIds[c.key][r.id] = true; });
+            });
+            boot(e.message);
           });
         }
+
+        function loopSync() {
+          setInterval(function () {
+            if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+            pullSince().then(function (batch) {
+              var n = mergeCloud(batch);
+              if (n > 0) { pendingNew += n; showReload(pendingNew); }
+              if (outboxCount() > 0) scheduleFlush();
+              else if (!badgeTimer) setBadge("☁ Nube al día", "#166534");
+            }).catch(function () { /* silencioso: el badge ya refleja lo pendiente */ });
+          }, PULL_MS);
+
+          window.addEventListener("online", function () { backoff = 0; flush(); });
+          document.addEventListener("visibilitychange", function () { if (document.visibilityState === "hidden") flush(); });
+          window.addEventListener("beforeunload", function (e) {
+            if (outboxCount() > 0) { e.preventDefault(); e.returnValue = ""; return ""; }
+          });
+        }
+
+        /* ---------------------------------------------------------- login */
         function start() {
           if (!window.supabase || !window.supabase.createClient) { setTimeout(start, 50); return; }
-          sb = window.supabase.createClient(URL_, KEY_);
+          // La sesión de auth se guarda en el localStorage REAL, no en el shim.
+          sb = window.supabase.createClient(URL_, KEY_, { auth: { storage: RAW } });
+          window.__sgClient = sb;
+
           var loading = document.getElementById("sag-loading");
           var form = document.getElementById("sag-form");
           var err = document.getElementById("sag-error");
           var btn = document.getElementById("sag-btn");
+
           sb.auth.getSession().then(function (r) {
-            if (r.data && r.data.session) { enterApp(); }
+            if (r.data && r.data.session) enterApp();
             else { loading.style.display = "none"; form.style.display = "block"; }
           });
+
           form.addEventListener("submit", function (e) {
             e.preventDefault();
             err.style.display = "none"; btn.disabled = true; btn.textContent = "Entrando…";
@@ -186,22 +529,23 @@
               password: document.getElementById("sag-pass").value
             }).then(function (r) {
               if (r.error) {
-                err.textContent = r.error.message === "Invalid login credentials" ? "Correo o contraseña incorrectos." : r.error.message;
+                err.textContent = r.error.message === "Invalid login credentials"
+                  ? "Correo o contraseña incorrectos." : r.error.message;
                 err.style.display = "block"; btn.disabled = false; btn.textContent = "Iniciar sesión";
               } else {
-                form.style.display = "none";
-                loading.style.display = "block";
-                enterApp();
+                form.style.display = "none"; loading.style.display = "block"; enterApp();
               }
             });
           });
         }
+
         setTimeout(function () {
           if (!window.supabase) {
             var l = document.getElementById("sag-loading");
             if (l) { l.textContent = "No se pudo conectar con la nube. Revisa tu internet y recarga."; l.style.color = "#dc2626"; }
           }
         }, 10000);
+
         start();
       })();
     </script>

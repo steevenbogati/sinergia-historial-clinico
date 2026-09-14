@@ -89,6 +89,14 @@ begin
   end loop;
 end $$;
 
+-- 4b) ÍNDICES -------------------------------------------------
+--    La app ahora sincroniza de forma incremental (solo lo que cambió
+--    desde la última vez), consultando por updated_at. Sin estos índices
+--    esa consulta recorre la tabla entera en cada refresco.
+create index if not exists clinical_records_updated_at_idx    on public.clinical_records    (updated_at);
+create index if not exists hyperbaric_patients_updated_at_idx on public.hyperbaric_patients (updated_at);
+create index if not exists hyperbaric_sessions_updated_at_idx on public.hyperbaric_sessions (updated_at);
+
 -- 5) VERIFICACIÓN --------------------------------------------
 select 'clinical_records'    as tabla, count(*) as filas from public.clinical_records
 union all
