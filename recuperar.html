@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Recuperación — SINERGIAMED</title>
+    <style>
+      :root { color-scheme: light; }
+      body { margin:0; padding:16px; background:#f5f5f4; color:#1c1917;
+             font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+      h1 { font-size:18px; margin:0 0 2px; }
+      p.sub { margin:0 0 16px; color:#78716c; font-size:13px; }
+      .card { background:#fff; border:1px solid #e7e5e4; border-radius:14px;
+              padding:16px; margin-bottom:12px; }
+      .card h2 { font-size:12px; margin:0 0 4px; color:#57534e; font-weight:700;
+                 text-transform:uppercase; letter-spacing:.04em; }
+      .card p { margin:0 0 12px; font-size:13px; color:#57534e; }
+      .fila { display:flex; justify-content:space-between; padding:6px 0;
+              border-bottom:1px solid #f5f5f4; font-size:14px; }
+      .fila:last-of-type { border-bottom:0; }
+      .fila b { font-variant-numeric:tabular-nums; }
+      button { width:100%; padding:15px; border:0; border-radius:12px; color:#fff;
+               font-size:15px; font-weight:700; cursor:pointer; }
+      button[disabled] { opacity:.45; }
+      .b1 { background:#0284c7; } .b2 { background:#15803d; }
+      .aviso { background:#fef3c7; border:1px solid #fcd34d; color:#78350f;
+               padding:11px 13px; border-radius:10px; font-size:13px; margin-bottom:14px; }
+      #barra { height:22px; background:#e7e5e4; border-radius:11px; overflow:hidden;
+               margin:12px 0 8px; display:none; }
+      #relleno { height:100%; width:0%; background:#15803d; transition:width .25s; }
+      #estado { font-size:13.5px; color:#44403c; min-height:20px; }
+      #log { margin-top:10px; font:11.5px/1.5 ui-monospace,Menlo,Consolas,monospace;
+             color:#78716c; max-height:170px; overflow:auto; white-space:pre-wrap; }
+      .ok { background:#15803d; color:#fff; padding:18px; border-radius:14px;
+            text-align:center; font-weight:700; display:none; margin-top:12px; }
+      .ok span { font-size:32px; display:block; }
+    </style>
+  </head>
+  <body>
+    <h1>Recuperación de registros</h1>
+    <p class="sub">SINERGIAMED — Historia Clínica</p>
+
+    <div class="aviso">
+      Esta página <strong>nunca borra nada</strong> de este teléfono. La copia
+      local se conserva intacta, pase lo que pase con la subida.
+    </div>
+
+    <div class="card">
+      <h2>Paso 1 · Guardar una copia</h2>
+      <p>Descarga un archivo con todo lo de este teléfono. Hazlo primero, antes de subir nada.</p>
+      <div id="resumen"></div>
+      <br />
+      <button class="b1" id="bajar">Descargar copia de seguridad</button>
+    </div>
+
+    <div class="card">
+      <h2>Paso 2 · Subir lo que falta</h2>
+      <p id="pendiente">Comprobando qué falta en la nube…</p>
+      <button class="b2" id="subir" disabled>Subir a la nube</button>
+      <div id="barra"><div id="relleno"></div></div>
+      <div id="estado"></div>
+      <div id="log"></div>
+    </div>
+
+    <div class="ok" id="final"><span id="finalN">0</span>registros recuperados</div>
+
+    <script>
+      (function () {
+        var URL_ = "https://yobhrbxrqupuqygryceb.supabase.co";
+        var KEY_ = "sb_publishable_LvoKk-1WDkdwio8iNc4C3g_V2R7qwSo";
+        var LOTE_BYTES = 250000;   // trozos pequeños: sobreviven a mala señal
+        var LOTE_FILAS  = 8;
+        var REINTENTOS  = 4;
+
+        var TABLAS = [
+          { key:"sinergiamed_patients_v1", t:"clinical_records", nombre:"Historias clínicas",
+            map:function(r){ var p=r.patient||{}; return { id:r.id, hc_number:r.hcNumber||null,
+              patient_name:p.fullName||null, id_number:p.idNumber||null, record_data:r }; } },
+          { key:"sinergiamed_hyperbaric_patients_v1", t:"hyperbaric_patients", nombre:"Pacientes hiperbárica",
+            map:function(r){ return { id:r.id, full_name:r.fullName||null, id_number:r.idNumber||null,
+              phone:r.phone||null, email:r.email||null, patient_data:r }; } },
+          { key:"sinergiamed_hyperbaric_sessions_v1", t:"hyperbaric_sessions", nombre:"Sesiones hiperbárica",
+            map:function(r){ return { id:r.id, patient_id:r.patientId||null, session_num:r.sessionNum||null,
+              session_date:r.date||null, time_in:r.timeIn||null, time_out:r.timeOut||null, session_data:r }; } }
+        ];
+
+        var $ = function (id) { return document.getElementById(id); };
+        function log(s) { $("log").textContent += s + "\n"; $("log").scrollTop = 1e6; }
+
+        function leer(k) {
+          try { var v = JSON.parse(localStorage.getItem(k) || "[]"); return Array.isArray(v) ? v : []; }
+          catch (e) { return []; }
+        }
+
+        // --- Resumen de lo que hay en el teléfono ---
+        var local = {}, totalLocal = 0, html = "";
+        TABLAS.forEach(function (c) {
+          local[c.key] = leer(c.key).filter(function (r) { return r && r.id != null; });
+          totalLocal += local[c.key].length;
+          html += '<div class="fila"><span>' + c.nombre + "</span><b>" + local[c.key].length + "</b></div>";
+        });
+        $("resumen").innerHTML = html;
+
+        // --- Paso 1: descargar copia ---
+        $("bajar").onclick = function () {
+          var datos = {};
+          TABLAS.forEach(function (c) { datos[c.key] = local[c.key]; });
+          var blob = new Blob([JSON.stringify(datos)], { type: "application/json" });
+          var a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = "RESPALDO_SINERGIAMED_" + new Date().toISOString().slice(0, 10) + ".json";
+          document.body.appendChild(a); a.click(); a.remove();
+          $("bajar").textContent = "✓ Copia descargada";
+        };
+
+        // --- Qué falta en la nube ---
+        function cab(extra) {
+          var h = { apikey: KEY_, Authorization: "Bearer " + KEY_ };
+          if (extra) for (var k in extra) h[k] = extra[k];
+          return h;
+        }
+
+        var faltan = {}, totalFaltan = 0;
+        Promise.all(TABLAS.map(function (c) {
+          return fetch(URL_ + "/rest/v1/" + c.t + "?select=id", { headers: cab() })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+              var enNube = {};
+              (d || []).forEach(function (x) { if (x && x.id) enNube[x.id] = 1; });
+              faltan[c.key] = local[c.key].filter(function (r) { return !enNube[r.id]; });
+              totalFaltan += faltan[c.key].length;
+            });
+        })).then(function () {
+          if (!totalFaltan) {
+            $("pendiente").textContent = "La nube ya tiene todo lo de este teléfono. No hay nada que subir.";
+            return;
+          }
+          var det = TABLAS.map(function (c) { return faltan[c.key].length + " " + c.nombre.toLowerCase(); })
+                          .filter(function (s) { return s.indexOf("0 ") !== 0; }).join(" · ");
+          $("pendiente").innerHTML = "Faltan <strong>" + totalFaltan + "</strong> registros en la nube.<br>" + det;
+          $("subir").disabled = false;
+        }).catch(function (e) {
+          $("pendiente").textContent = "No se pudo consultar la nube: " + e.message + ". Revisa el internet y recarga.";
+        });
+
+        // --- Paso 2: subir por trozos, con reintentos ---
+        function enviar(c, filas, intento) {
+          intento = intento || 1;
+          return fetch(URL_ + "/rest/v1/" + c.t + "?on_conflict=id", {
+            method: "POST",
+            headers: cab({ "Content-Type": "application/json",
+                           Prefer: "resolution=merge-duplicates,return=minimal" }),
+            body: JSON.stringify(filas.map(c.map))
+          }).then(function (r) {
+            if (!r.ok) return r.text().then(function (t) { throw new Error("HTTP " + r.status + " " + t.slice(0, 120)); });
+          }).catch(function (e) {
+            if (intento >= REINTENTOS) throw e;
+            log("   reintento " + intento + " (" + e.message.slice(0, 60) + ")");
+            return new Promise(function (res) { setTimeout(res, 1500 * intento); })
+              .then(function () { return enviar(c, filas, intento + 1); });
+          });
+        }
+
+        $("subir").onclick = function () {
+          $("subir").disabled = true;
+          $("barra").style.display = "block";
+          var hechos = 0;
+
+          var trozos = [];
+          TABLAS.forEach(function (c) {
+            var buf = [], bytes = 0;
+            faltan[c.key].forEach(function (r) {
+              var s = JSON.stringify(r).length;
+              if (buf.length && (buf.length >= LOTE_FILAS || bytes + s > LOTE_BYTES)) {
+                trozos.push({ c: c, filas: buf }); buf = []; bytes = 0;
+              }
+              buf.push(r); bytes += s;
+            });
+            if (buf.length) trozos.push({ c: c, filas: buf });
+          });
+
+          log("Subiendo " + totalFaltan + " registros en " + trozos.length + " envíos…");
+
+          var p = Promise.resolve();
+          trozos.forEach(function (tr, i) {
+            p = p.then(function () {
+              $("estado").textContent = "Envío " + (i + 1) + " de " + trozos.length + " — no cierres esta página";
+              return enviar(tr.c, tr.filas).then(function () {
+                hechos += tr.filas.length;
+                $("relleno").style.width = Math.round(hechos / totalFaltan * 100) + "%";
+                log("✓ " + hechos + "/" + totalFaltan);
+              });
+            });
+          });
+
+          p.then(function () {
+            $("estado").textContent = "Listo.";
+            $("finalN").textContent = hechos;
+            $("final").style.display = "block";
+            log("TERMINADO. La copia de este teléfono sigue intacta.");
+          }).catch(function (e) {
+            $("estado").textContent = "Se detuvo: " + e.message;
+            log("ERROR tras varios intentos. Subidos " + hechos + " de " + totalFaltan + ".");
+            log("Nada se perdió. Recarga la página y vuelve a darle a Subir.");
+            $("subir").disabled = false;
+            $("subir").textContent = "Reintentar lo que falta";
+          });
+        };
+      })();
+    </script>
+  </body>
+</html>
