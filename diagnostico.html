@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Diagnóstico — SINERGIAMED</title>
+    <style>
+      :root { color-scheme: light; }
+      body { margin:0; padding:18px; background:#f5f5f4; color:#1c1917;
+             font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+      h1 { font-size:18px; margin:0 0 2px; }
+      p.sub { margin:0 0 18px; color:#78716c; font-size:13px; }
+      .aviso { background:#dcfce7; border:1px solid #86efac; color:#14532d;
+               padding:10px 12px; border-radius:10px; font-size:13px; margin-bottom:16px; }
+      .card { background:#fff; border:1px solid #e7e5e4; border-radius:14px;
+              padding:14px 16px; margin-bottom:12px; }
+      .card h2 { font-size:13px; margin:0 0 10px; color:#57534e; font-weight:700;
+                 text-transform:uppercase; letter-spacing:.04em; }
+      .fila { display:flex; justify-content:space-between; align-items:baseline;
+              padding:7px 0; border-bottom:1px solid #f5f5f4; }
+      .fila:last-child { border-bottom:0; }
+      .fila span { font-size:13.5px; color:#44403c; }
+      .n { font-size:26px; font-weight:800; font-variant-numeric:tabular-nums; }
+      .si { color:#15803d; } .no { color:#a8a29e; }
+      .total { margin-top:14px; padding:16px; border-radius:14px; text-align:center; }
+      .hay { background:#15803d; color:#fff; }
+      .nada { background:#e7e5e4; color:#57534e; }
+      .total .g { font-size:34px; font-weight:800; display:block; }
+      code { background:#f5f5f4; padding:1px 5px; border-radius:4px; font-size:12px; }
+    </style>
+  </head>
+  <body>
+    <h1>Diagnóstico del dispositivo</h1>
+    <p class="sub">SINERGIAMED — Historia Clínica</p>
+    <div class="aviso">
+      <strong>Solo lectura.</strong> Esta página no sube, no borra y no modifica
+      nada. Únicamente muestra lo que este teléfono tiene guardado.
+    </div>
+    <div id="salida">Leyendo…</div>
+
+    <script>
+      (function () {
+        var CLAVES = [
+          ["sinergiamed_patients_v1", "Historias clínicas"],
+          ["sinergiamed_hyperbaric_patients_v1", "Pacientes hiperbárica"],
+          ["sinergiamed_hyperbaric_sessions_v1", "Sesiones hiperbárica"]
+        ];
+
+        function filas(v) {
+          try { var a = JSON.parse(v || "[]"); return Array.isArray(a) ? a.length : 0; }
+          catch (e) { return 0; }
+        }
+
+        var html = "", total = 0, bytes = 0;
+
+        html += '<div class="card"><h2>Guardado en este teléfono</h2>';
+        CLAVES.forEach(function (c) {
+          var v = null;
+          try { v = localStorage.getItem(c[0]); } catch (e) {}
+          var n = v == null ? 0 : filas(v);
+          total += n;
+          bytes += v ? v.length : 0;
+          html += '<div class="fila"><span>' + c[1] + '</span>' +
+                  '<span class="n ' + (n > 0 ? "si" : "no") + '">' + n + "</span></div>";
+        });
+        html += "</div>";
+
+        // Bandeja de salida: lo que quedó pendiente de subir.
+        var pend = 0;
+        try {
+          var ob = JSON.parse(localStorage.getItem("sinergia_outbox_v1") || "{}");
+          Object.keys(ob).forEach(function (k) { pend += Object.keys(ob[k] || {}).length; });
+        } catch (e) {}
+
+        html += '<div class="card"><h2>Otros datos</h2>' +
+                '<div class="fila"><span>Pendiente de subir</span><span class="n ' +
+                (pend > 0 ? "si" : "no") + '">' + pend + "</span></div>" +
+                '<div class="fila"><span>Espacio ocupado</span><span>' +
+                (bytes / 1048576).toFixed(2) + " MB</span></div>" +
+                '<div class="fila"><span>Versión guardada</span><span><code>' +
+                (localStorage.getItem("sinergia_purge_v2") ? "purge_v2" : "—") + "</code></span></div>" +
+                "</div>";
+
+        var suma = total + pend;
+        html += '<div class="total ' + (suma > 0 ? "hay" : "nada") + '">' +
+                '<span class="g">' + suma + "</span>" +
+                (suma > 0
+                  ? "registros en este teléfono<br><strong>¡SÍ SIRVE! Manda esta pantalla</strong>"
+                  : "registros — este teléfono está vacío") +
+                "</div>";
+
+        document.getElementById("salida").innerHTML = html;
+      })();
+    </script>
+  </body>
+</html>
